@@ -29,6 +29,10 @@
 /**************************************************************************/
 
 #include "mesh_storage.h"
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+#include "core/os/os.h"
+#include "core/string/print_string.h"
+#endif
 
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
@@ -1538,6 +1542,12 @@ void MeshStorage::_multimesh_free(RID p_rid) {
 	// Remove from interpolator.
 	_interpolation_data.notify_free_multimesh(p_rid);
 	_update_dirty_multimeshes();
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	MultiMesh *diag_multimesh = multimesh_owner.get_or_null(p_rid);
+	if (diag_multimesh && diag_multimesh->instances == 10000 && diag_multimesh->diag_phase != 2 && diag_multimesh->diag_window_us != 0) {
+		_multimesh_diag_print(diag_multimesh, diag_multimesh->diag_phase == 0 ? "pre_capture_partial" : "capture_partial");
+	}
+#endif
 	multimesh_allocate_data(p_rid, 0, RSE::MULTIMESH_TRANSFORM_2D);
 	MultiMesh *multimesh = multimesh_owner.get_or_null(p_rid);
 	multimesh->dependency.deleted_notify(p_rid);
@@ -1579,6 +1589,9 @@ void MeshStorage::_multimesh_allocate_data(RID p_multimesh, int p_instances, RSE
 	multimesh->custom_data_offset_cache = multimesh->color_offset_cache + (p_use_colors ? 4 : 0);
 	multimesh->stride_cache = multimesh->custom_data_offset_cache + (p_use_custom_data ? 4 : 0);
 	multimesh->buffer_set = false;
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+	multimesh->skip_dirty_upload = false;
+#endif
 
 	multimesh->indirect = p_use_indirect;
 	multimesh->command_buffer = RID();
@@ -1607,6 +1620,9 @@ void MeshStorage::_multimesh_enable_motion_vectors(MultiMesh *multimesh) {
 	}
 
 	multimesh->motion_vectors_enabled = true;
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+	multimesh->skip_dirty_upload = false;
+#endif
 
 	multimesh->motion_vectors_current_offset = 0;
 	multimesh->motion_vectors_previous_offset = 0;
@@ -1627,6 +1643,12 @@ void MeshStorage::_multimesh_enable_motion_vectors(MultiMesh *multimesh) {
 	} else if (!multimesh->data_cache.is_empty()) {
 		// Simply upload the data cached in the CPU, which should already be doubled in size.
 		ERR_FAIL_COND(multimesh->data_cache.size() * sizeof(float) != size_t(new_buffer_size));
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+		if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+			multimesh->diag.motion_full_requests++;
+			multimesh->diag.requested_bytes += new_buffer_size;
+		}
+#endif
 		RD::get_singleton()->buffer_update(new_buffer, 0, new_buffer_size, multimesh->data_cache.ptr());
 	}
 
@@ -1717,6 +1739,38 @@ void MeshStorage::_multimesh_set_mesh(RID p_multimesh, RID p_mesh) {
 
 #define MULTIMESH_DIRTY_REGION_SIZE 512
 
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+// Called only for the 10,000-instance workload, at one setter or bulk call per frame.
+// RenderingServer serializes these MeshStorage calls on the rendering thread.
+void MeshStorage::_multimesh_diag_print(const MultiMesh *p_multimesh, const char *p_window) {
+	const MultiMeshDiagCounters &d = p_multimesh->diag;
+	print_line(vformat("[GACE_MM_DIAG] window=%s elapsed_us=%d instances=%d cache=%d motion=%d individual=%d bulk=%d cache_init=%d dirty_marks=%d unique_regions=%d mark_all=%d regions_processed=%d direct_full=%d dirty_full=%d dirty_partial=%d motion_full=%d requested_bytes=%d aabb_rebuild=%d process_calls=%d process_us=%d",
+			p_window, OS::get_singleton()->get_ticks_usec() - p_multimesh->diag_window_us, p_multimesh->instances, int(!p_multimesh->data_cache.is_empty()), int(p_multimesh->motion_vectors_enabled),
+			d.individual_calls, d.bulk_calls, d.cache_inits, d.dirty_marks, d.unique_regions,
+			d.mark_all_calls, d.dirty_regions_processed, d.direct_full_requests, d.dirty_full_requests,
+			d.dirty_partial_requests, d.motion_full_requests, d.requested_bytes, d.aabb_rebuilds,
+			d.process_calls, d.process_us));
+}
+
+void MeshStorage::_multimesh_diag_boundary(MultiMesh *p_multimesh) {
+	if (p_multimesh->instances != 10000 || p_multimesh->diag_phase == 2) {
+		return;
+	}
+	const uint64_t now = OS::get_singleton()->get_ticks_usec();
+	if (p_multimesh->diag_window_us == 0) {
+		p_multimesh->diag_window_us = now;
+		return;
+	}
+	const uint64_t duration = p_multimesh->diag_phase == 0 ? 5000000 : 15000000;
+	if (now - p_multimesh->diag_window_us >= duration) {
+		_multimesh_diag_print(p_multimesh, p_multimesh->diag_phase == 0 ? "pre_capture" : "capture");
+		p_multimesh->diag = MultiMeshDiagCounters();
+		p_multimesh->diag_window_us = now;
+		p_multimesh->diag_phase++;
+	}
+}
+#endif
+
 void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 	if (multimesh->data_cache.size() > 0) {
 		return; //already local
@@ -1729,6 +1783,11 @@ void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 		buffer_size *= 2;
 	}
 	multimesh->data_cache.resize(buffer_size);
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+		multimesh->diag.cache_inits++;
+	}
+#endif
 	{
 		float *w = multimesh->data_cache.ptrw();
 
@@ -1788,10 +1847,22 @@ bool MeshStorage::_multimesh_uses_motion_vectors(MultiMesh *multimesh) {
 }
 
 void MeshStorage::_multimesh_mark_dirty(MultiMesh *multimesh, int p_index, bool p_aabb) {
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+	// An individual edit after a full submission still needs the deferred upload.
+	multimesh->skip_dirty_upload = false;
+#endif
 	uint32_t region_index = p_index / MULTIMESH_DIRTY_REGION_SIZE;
 #ifdef DEBUG_ENABLED
 	uint32_t data_cache_dirty_region_count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
 	ERR_FAIL_UNSIGNED_INDEX(region_index, data_cache_dirty_region_count); //bug
+#endif
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+		multimesh->diag.dirty_marks++;
+		if (!multimesh->data_cache_dirty_regions[region_index]) {
+			multimesh->diag.unique_regions++;
+		}
+	}
 #endif
 	if (!multimesh->data_cache_dirty_regions[region_index]) {
 		multimesh->data_cache_dirty_regions[region_index] = true;
@@ -1810,6 +1881,24 @@ void MeshStorage::_multimesh_mark_dirty(MultiMesh *multimesh, int p_index, bool 
 }
 
 void MeshStorage::_multimesh_mark_all_dirty(MultiMesh *multimesh, bool p_data, bool p_aabb) {
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+	if (p_data) {
+		multimesh->skip_dirty_upload = false;
+	}
+#endif
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+		multimesh->diag.mark_all_calls++;
+		if (p_data) {
+			uint32_t count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
+			for (uint32_t i = 0; i < count; i++) {
+				if (!multimesh->data_cache_dirty_regions[i]) {
+					multimesh->diag.unique_regions++;
+				}
+			}
+		}
+	}
+#endif
 	if (p_data) {
 		uint32_t data_cache_dirty_region_count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
 
@@ -1837,6 +1926,11 @@ void MeshStorage::_multimesh_re_create_aabb(MultiMesh *multimesh, const float *p
 	if (multimesh->custom_aabb != AABB()) {
 		return;
 	}
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+		multimesh->diag.aabb_rebuilds++;
+	}
+#endif
 	AABB aabb;
 	AABB mesh_aabb = mesh_get_aabb(multimesh->mesh);
 	for (int i = 0; i < p_instances; i++) {
@@ -1883,6 +1977,14 @@ void MeshStorage::_multimesh_instance_set_transform(RID p_multimesh, int p_index
 	ERR_FAIL_INDEX(p_index, multimesh->instances);
 	ERR_FAIL_COND(multimesh->xform_format != RSE::MULTIMESH_TRANSFORM_3D);
 
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	if (p_index == 0) {
+		_multimesh_diag_boundary(multimesh);
+	}
+	if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+		multimesh->diag.individual_calls++;
+	}
+#endif
 	_multimesh_make_local(multimesh);
 
 	bool uses_motion_vectors = (RSG::viewport->get_num_viewports_with_motion_vectors() > 0) || (RendererCompositorStorage::get_singleton()->get_num_compositor_effects_with_motion_vectors() > 0);
@@ -2108,6 +2210,12 @@ void MeshStorage::_multimesh_set_buffer(RID p_multimesh, const Vector<float> &p_
 	ERR_FAIL_NULL(multimesh);
 	ERR_FAIL_COND(p_buffer.size() != (multimesh->instances * (int)multimesh->stride_cache));
 
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	_multimesh_diag_boundary(multimesh);
+	if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+		multimesh->diag.bulk_calls++;
+	}
+#endif
 	bool used_motion_vectors = multimesh->motion_vectors_enabled;
 	bool uses_motion_vectors = (RSG::viewport->get_num_viewports_with_motion_vectors() > 0) || (RendererCompositorStorage::get_singleton()->get_num_compositor_effects_with_motion_vectors() > 0);
 	if (uses_motion_vectors) {
@@ -2124,12 +2232,31 @@ void MeshStorage::_multimesh_set_buffer(RID p_multimesh, const Vector<float> &p_
 		}
 	}
 
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+	bool direct_buffer_update_succeeded = false;
+#endif
 	{
 		const float *r = p_buffer.ptr();
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+		if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+			multimesh->diag.direct_full_requests++;
+			multimesh->diag.requested_bytes += p_buffer.size() * sizeof(float);
+		}
+#endif
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+		direct_buffer_update_succeeded = RD::get_singleton()->buffer_update(multimesh->buffer, multimesh->motion_vectors_current_offset * multimesh->stride_cache * sizeof(float), p_buffer.size() * sizeof(float), r) == OK;
+#else
 		RD::get_singleton()->buffer_update(multimesh->buffer, multimesh->motion_vectors_current_offset * multimesh->stride_cache * sizeof(float), p_buffer.size() * sizeof(float), r);
+#endif
 		if (multimesh->motion_vectors_enabled && !used_motion_vectors) {
 			// Motion vectors were just enabled, and the other half of the buffer will be empty.
 			// Need to ensure that both halves are filled for correct operation.
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+			if (multimesh->instances == 10000 && multimesh->diag_phase != 2) {
+				multimesh->diag.motion_full_requests++;
+				multimesh->diag.requested_bytes += p_buffer.size() * sizeof(float);
+			}
+#endif
 			RD::get_singleton()->buffer_update(multimesh->buffer, multimesh->motion_vectors_previous_offset * multimesh->stride_cache * sizeof(float), p_buffer.size() * sizeof(float), r);
 		}
 		multimesh->buffer_set = true;
@@ -2139,6 +2266,12 @@ void MeshStorage::_multimesh_set_buffer(RID p_multimesh, const Vector<float> &p_
 		float *cache_data = multimesh->data_cache.ptrw();
 		memcpy(cache_data + (multimesh->motion_vectors_current_offset * multimesh->stride_cache), p_buffer.ptr(), p_buffer.size() * sizeof(float));
 		_multimesh_mark_all_dirty(multimesh, true, true); //update AABB
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+		// Keep the dirty bookkeeping and AABB path intact. The direct upload already
+		// contains the full current data unless a later individual edit invalidates it.
+		// Motion vectors and physics interpolation retain their existing upload path.
+		multimesh->skip_dirty_upload = direct_buffer_update_succeeded && !multimesh->motion_vectors_enabled && !multimesh->interpolator.interpolated;
+#endif
 	} else if (multimesh->mesh.is_valid()) {
 		//if we have a mesh set, we need to re-generate the AABB from the new data
 		const float *data = p_buffer.ptr();
@@ -2257,6 +2390,14 @@ MeshStorage::MultiMeshInterpolator *MeshStorage::_multimesh_get_interpolator(RID
 void MeshStorage::_update_dirty_multimeshes() {
 	while (multimesh_dirty_list) {
 		MultiMesh *multimesh = multimesh_dirty_list;
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+		const bool diag_active = multimesh->instances == 10000 && multimesh->diag_phase != 2;
+		const uint64_t diag_begin_us = diag_active ? OS::get_singleton()->get_ticks_usec() : 0;
+		if (diag_active) {
+			multimesh->diag.process_calls++;
+			multimesh->diag.dirty_regions_processed += multimesh->data_cache_dirty_region_count + multimesh->previous_data_cache_dirty_region_count;
+		}
+#endif
 
 		if (multimesh->data_cache.size()) { //may have been cleared, so only process if it exists
 
@@ -2270,9 +2411,21 @@ void MeshStorage::_update_dirty_multimeshes() {
 				uint32_t visible_region_count = visible_instances == 0 ? 0 : Math::division_round_up(visible_instances, (uint32_t)MULTIMESH_DIRTY_REGION_SIZE);
 
 				uint32_t region_size = multimesh->stride_cache * MULTIMESH_DIRTY_REGION_SIZE * sizeof(float);
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+				// The successful direct full-buffer upload already covers these regions.
+				// Do not change region history or AABB processing below.
+				if (!(multimesh->skip_dirty_upload && !multimesh->motion_vectors_enabled && !multimesh->interpolator.interpolated)) {
+#endif
 				if (total_dirty_regions > 32 || total_dirty_regions > visible_region_count / 2) {
 					//if there too many dirty regions, or represent the majority of regions, just copy all, else transfer cost piles up too much
-					RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float), MIN(visible_region_count * region_size, multimesh->instances * (uint32_t)multimesh->stride_cache * (uint32_t)sizeof(float)), data);
+					uint32_t update_bytes = MIN(visible_region_count * region_size, multimesh->instances * (uint32_t)multimesh->stride_cache * (uint32_t)sizeof(float));
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+					if (diag_active) {
+						multimesh->diag.dirty_full_requests++;
+						multimesh->diag.requested_bytes += update_bytes;
+					}
+#endif
+					RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float), update_bytes, data);
 				} else {
 					//not that many regions? update them all
 					for (uint32_t i = 0; i < visible_region_count; i++) {
@@ -2280,17 +2433,30 @@ void MeshStorage::_update_dirty_multimeshes() {
 							uint32_t offset = i * region_size;
 							uint32_t size = multimesh->stride_cache * (uint32_t)multimesh->instances * (uint32_t)sizeof(float);
 							uint32_t region_start_index = multimesh->stride_cache * MULTIMESH_DIRTY_REGION_SIZE * i;
-							RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float) + offset, MIN(region_size, size - offset), &data[region_start_index]);
+							uint32_t update_bytes = MIN(region_size, size - offset);
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+							if (diag_active) {
+								multimesh->diag.dirty_partial_requests++;
+								multimesh->diag.requested_bytes += update_bytes;
+							}
+#endif
+							RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float) + offset, update_bytes, &data[region_start_index]);
 						}
 					}
 				}
 
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+				}
+#endif
 				memcpy(multimesh->previous_data_cache_dirty_regions, multimesh->data_cache_dirty_regions, data_cache_dirty_region_count * sizeof(bool));
 				memset(multimesh->data_cache_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
 
 				multimesh->previous_data_cache_dirty_region_count = multimesh->data_cache_dirty_region_count;
 				multimesh->data_cache_dirty_region_count = 0;
 			}
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+			multimesh->skip_dirty_upload = false;
+#endif
 
 			if (multimesh->aabb_dirty) {
 				//aabb is dirty..
@@ -2302,6 +2468,11 @@ void MeshStorage::_update_dirty_multimeshes() {
 			}
 		}
 
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+		if (diag_active) {
+			multimesh->diag.process_us += OS::get_singleton()->get_ticks_usec() - diag_begin_us;
+		}
+#endif
 		multimesh_dirty_list = multimesh->dirty_list;
 
 		multimesh->dirty_list = nullptr;

@@ -226,8 +226,37 @@ private:
 
 	/* MultiMesh */
 
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	struct MultiMeshDiagCounters {
+		uint64_t individual_calls = 0;
+		uint64_t bulk_calls = 0;
+		uint64_t cache_inits = 0;
+		uint64_t dirty_marks = 0;
+		uint64_t unique_regions = 0;
+		uint64_t mark_all_calls = 0;
+		uint64_t dirty_regions_processed = 0;
+		uint64_t direct_full_requests = 0;
+		uint64_t dirty_full_requests = 0;
+		uint64_t dirty_partial_requests = 0;
+		uint64_t motion_full_requests = 0;
+		uint64_t requested_bytes = 0;
+		uint64_t aabb_rebuilds = 0;
+		uint64_t process_calls = 0;
+		uint64_t process_us = 0;
+	};
+#endif
+
 	struct MultiMesh {
 		RID mesh;
+#ifdef GACE_MULTIMESH_SKIP_REDUNDANT_UPDATE
+		// A successful full-buffer upload can satisfy pending CPU-cache regions.
+		bool skip_dirty_upload = false;
+#endif
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+		MultiMeshDiagCounters diag;
+		uint64_t diag_window_us = 0;
+		uint8_t diag_phase = 0;
+#endif
 		int instances = 0;
 		RSE::MultimeshTransformFormat xform_format = RSE::MULTIMESH_TRANSFORM_3D;
 		bool uses_colors = false;
@@ -268,6 +297,10 @@ private:
 	mutable RID_Owner<MultiMesh, true> multimesh_owner;
 
 	MultiMesh *multimesh_dirty_list = nullptr;
+#ifdef GACE_MULTIMESH_DIAGNOSTICS
+	void _multimesh_diag_boundary(MultiMesh *p_multimesh);
+	void _multimesh_diag_print(const MultiMesh *p_multimesh, const char *p_window);
+#endif
 
 	_FORCE_INLINE_ void _multimesh_make_local(MultiMesh *multimesh) const;
 	_FORCE_INLINE_ void _multimesh_enable_motion_vectors(MultiMesh *multimesh);
